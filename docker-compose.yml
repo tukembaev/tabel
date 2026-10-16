@@ -1,0 +1,94 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tabel
+      POSTGRES_PASSWORD: tabel
+      POSTGRES_DB: tabel
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tabel -d tabel"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  migrate:
+    image: postgres:16-alpine
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        until pg_isready -h postgres -U tabel; do sleep 1; done
+        DBURL="postgres://tabel:tabel@postgres:5432/tabel?sslmode=disable"
+        apply_up() {
+          sed '/^-- +goose Down/,$$d;/^-- +goose/d' "$$1" | psql "$$DBURL" -v ON_ERROR_STOP=1
+        }
+        if ! psql "$$DBURL" -tAc "SELECT to_regclass('public.user_snapshots')" | grep -q user_snapshots; then
+          apply_up /migrations/001_init.sql
+        fi
+        if ! psql "$$DBURL" -tAc "SELECT 1 FROM information_schema.columns WHERE table_name='attendance_sessions' AND column_name='entry_building'" | grep -q 1; then
+          apply_up /migrations/002_employees_only.sql
+        fi
+        if ! psql "$$DBURL" -tAc "SELECT to_regclass('public.timesheet_edits')" | grep -q timesheet_edits; then
+          apply_up /migrations/003_lunch_and_head_edit.sql
+        else
+          echo "schema already applied"
+        fi
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: ["/app/tabel-server"]
+    environment:
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://tabel:tabel@postgres:5432/tabel?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: dev-secret-change-me
+      UNIVERSITY_ID: kstu
+      TIMEZONE: Asia/Bishkek
+      STAFF_START: "08:00"
+      STAFF_CUTOFF: "18:30"
+      LUNCH_START: "12:00"
+      LUNCH_END: "13:00"
+      DUPLICATE_SCAN_WINDOW: "2m"
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+
+  worker:
+    build: .
+    command: ["/app/tabel-worker"]
+    environment:
+      DATABASE_URL: postgres://tabel:tabel@postgres:5432/tabel?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: dev-secret-change-me
+      UNIVERSITY_ID: kstu
+      TIMEZONE: Asia/Bishkek
+      STAFF_START: "08:00"
+      STAFF_CUTOFF: "18:30"
+      LUNCH_START: "12:00"
+      LUNCH_END: "13:00"
+      DUPLICATE_SCAN_WINDOW: "2m"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+
+volumes:
+  pgdata:

@@ -1,0 +1,17 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "KSTU Tabel API",
+    "version": "2.0.0",
+    "description": "See api/openapi.yaml or /swagger/ for full spec. Frontend manual: docs/FRONTEND.md"
+  },
+  "servers": [{ "url": "http://localhost:8080" }],
+  "paths": {
+    "/swagger/": {
+      "get": {
+        "summary": "Swagger UI",
+        "responses": { "200": { "description": "HTML" } }
+      }
+    }
+  }
+}

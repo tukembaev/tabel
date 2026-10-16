@@ -1,0 +1,24 @@
+[Unit]
+Description=KSTU Tabel Worker (asynq: auto-close, archive)
+After=network.target postgresql.service redis.service tabel-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tabel
+Group=tabel
+WorkingDirectory=/opt/tabel
+EnvironmentFile=/etc/tabel/tabel.env
+ExecStart=/opt/tabel/bin/tabel-worker
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/tabel
+
+[Install]
+WantedBy=multi-user.target

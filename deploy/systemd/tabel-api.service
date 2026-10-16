@@ -1,0 +1,25 @@
+[Unit]
+Description=KSTU Tabel API
+After=network.target postgresql.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tabel
+Group=tabel
+WorkingDirectory=/opt/tabel
+EnvironmentFile=/etc/tabel/tabel.env
+ExecStart=/opt/tabel/bin/tabel-server
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/tabel
+
+[Install]
+WantedBy=multi-user.target

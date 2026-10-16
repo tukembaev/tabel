@@ -1,0 +1,1057 @@
+openapi: 3.0.3
+info:
+  title: KSTU Tabel API
+  description: |
+    Микросервис электронного табеля КГТУ им. И. Раззакова.
+    Только сотрудники: приход/уход по QR, неявки, отчёты.
+
+    **Auth (все `/v1/*`):** один из вариантов:
+    1. **Basic** — в Swagger → Authorize → Username `user` / Password `user`
+    2. **Cookie** — `POST /auth/login` с `{"username":"user","password":"user"}` → cookie `access_token`
+    3. **Bearer JWT** — `Authorization: Bearer <access_jwt>` (HS256, claim `sub` = UUID)
+
+    Локальный тестовый пользователь (`DEV_USER_ID`): `15b7fbe4-95d0-4319-a6c5-fa1ea13391ed`.
+
+    **Перед сканами:** после логина один раз `POST /v1/me/sync`. На каждый QR uadmin не вызывается.
+  version: 2.0.0
+  contact:
+    name: Tabel backend
+servers:
+  - url: http://localhost:8080
+    description: Local
+  - url: https://tabel.kstu.kg
+    description: Production (example)
+
+tags:
+  - name: Auth
+  - name: Health
+  - name: Me
+  - name: Attendance
+  - name: Absences
+  - name: Reports
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Health check
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+              example:
+                status: ok
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Локальный логин (cookie + JWT)
+      description: |
+        Для локального теста / Swagger. Ставит HttpOnly cookie `access_token`
+        и возвращает тот же JWT в теле. Credentials по умолчанию: `user` / `user`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  example: user
+                password:
+                  type: string
+                  example: user
+            example:
+              username: user
+              password: user
+      responses:
+        "200":
+          description: Cookie установлена
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+                example: access_token=eyJ...; Path=/; HttpOnly; SameSite=Lax
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                  user_id:
+                    type: string
+                    format: uuid
+                    example: 15b7fbe4-95d0-4319-a6c5-fa1ea13391ed
+                  expires_in:
+                    type: integer
+                    example: 86400
+        "401":
+          $ref: "#/components/responses/Error"
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Сброс cookie access_token
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example:
+                status: ok
+
+  /v1/me/sync:
+    post:
+      tags: [Me]
+      summary: Синхронизация профиля (snapshot)
+      description: |
+        Вызывать после логина / раз в ~24ч.
+        Данные берутся из uadmin `GET /users/api/v1/users/me`.
+        `user_id` берётся из JWT `sub` / cookie / Basic, не из body.
+        Доступ к табелю — только при `has_employee=true`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SyncMeRequest"
+            example:
+              username: "20809200450206"
+              first_name: "Арслан"
+              last_name: "Жумалиев"
+              middle_name: ""
+              has_employee: true
+              is_department_head: false
+              department_id: "dept-ivt-001"
+              department_name: "Кафедра ИВТ"
+      responses:
+        "200":
+          description: Snapshot сохранён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserSnapshot"
+        "401":
+          $ref: "#/components/responses/Error"
+        "400":
+          $ref: "#/components/responses/Error"
+
+  /v1/attendance/scan:
+    post:
+      tags: [Attendance]
+      summary: Скан QR — приход, уход или игнор дубля
+      description: |
+        Клиент шлёт полный URL QR (`https://qr.kstu.kg/kstu/1/102`).
+        Один цикл в день: нет сессии → check_in; открытая → check_out;
+        auto_cutoff + поздний скан → check_out (18:30 заменяется на реальное время);
+        уже закрыто вручную → already_closed. Обед 12:00–13:00 вычитается автоматически.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScanRequest"
+            example:
+              qr_url: "https://qr.kstu.kg/kstu/1/102"
+      responses:
+        "201":
+          description: Новый цикл открыт (check_in)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScanResult"
+        "200":
+          description: Уход или игнор дубля
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScanResult"
+        "400":
+          description: Невалидный QR / после cutoff
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "check-in after staff cutoff is not allowed"
+        "403":
+          description: Не сотрудник
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "forbidden"
+        "409":
+          description: Approved absence на сегодня
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "conflict: approved absence for today"
+        "428":
+          $ref: "#/components/responses/SnapshotRequired"
+
+  /v1/timesheet/days:
+    put:
+      tags: [Attendance]
+      summary: Зав/редактор правит день сотрудника
+      description: |
+        kind=attendance — явка (без времени = 08:00–18:30 минус обед).
+        kind=absence — код неявки. kind=clear — стереть день.
+        Нужны is_department_head или can_edit_timesheet, тот же отдел.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EditDayRequest"
+            example:
+              user_id: "15b7fbe4-95d0-4319-a6c5-fa1ea13391ed"
+              work_date: "2026-09-17"
+              kind: attendance
+              note: "был, QR не сканировал"
+      responses:
+        "200":
+          description: День обновлён
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EditDayResult"
+        "403":
+          $ref: "#/components/responses/Error"
+
+  /v1/timesheet/edits:
+    get:
+      tags: [Attendance]
+      summary: Журнал правок табеля отдела
+      parameters:
+        - $ref: "#/components/parameters/from"
+        - $ref: "#/components/parameters/to"
+      responses:
+        "200":
+          description: Список правок
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TimesheetEdit"
+
+  /v1/departments/{departmentID}/employees:
+    get:
+      tags: [Reports]
+      summary: Сотрудники отдела
+      parameters:
+        - $ref: "#/components/parameters/departmentID"
+      responses:
+        "200":
+          description: Snapshots
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/UserSnapshot"
+
+  /v1/departments/{departmentID}/missing:
+    get:
+      tags: [Reports]
+      summary: Дни без отметки (не прогул — очередь зава)
+      parameters:
+        - $ref: "#/components/parameters/departmentID"
+        - $ref: "#/components/parameters/from"
+        - $ref: "#/components/parameters/to"
+      responses:
+        "200":
+          description: Missing marks
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/MissingMark"
+
+  /v1/departments/{departmentID}/export:
+    get:
+      tags: [Reports]
+      summary: Полный срез отдела для отчётности
+      parameters:
+        - $ref: "#/components/parameters/departmentID"
+        - $ref: "#/components/parameters/from"
+        - $ref: "#/components/parameters/to"
+      responses:
+        "200":
+          description: Employees, sessions, exceptions, edits, timesheet, missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DepartmentExport"
+
+  /v1/reports/departments/{departmentID}:
+    get:
+      tags: [Reports]
+      summary: Табель конкретного отдела
+      parameters:
+        - $ref: "#/components/parameters/departmentID"
+        - $ref: "#/components/parameters/from"
+        - $ref: "#/components/parameters/to"
+      responses:
+        "200":
+          description: Отчёт отдела (все сотрудники)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DepartmentReport"
+
+  /v1/absences/requests:
+    post:
+      tags: [Absences]
+      summary: Заявка сотрудника на неявку
+      description: Нельзя если уже была отметка в этот день. Коды П/Ув — только зав.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AbsenceRequest"
+            example:
+              work_date: "2026-08-07"
+              code: "БЛ"
+              note: "Больничный лист"
+      responses:
+        "201":
+          description: Заявка создана (pending)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DayException"
+        "409":
+          description: Уже есть отметка / exception
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "has check-in"
+
+  /v1/absences/pending:
+    get:
+      tags: [Absences]
+      summary: Pending-заявки отдела (зав)
+      responses:
+        "200":
+          description: Список
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DayException"
+              example: []
+        "403":
+          description: Не зав отдела
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "forbidden"
+
+  /v1/absences/head:
+    post:
+      tags: [Absences]
+      summary: Зав сразу ставит код дня
+      description: Только если у сотрудника не было отметки в этот день. Тот же department_id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HeadAbsenceRequest"
+            example:
+              user_id: "15b7fbe4-95d0-4319-a6c5-fa1ea13391ed"
+              work_date: "2026-08-07"
+              code: "П"
+              note: "Прогул"
+      responses:
+        "201":
+          description: Код approved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DayException"
+
+  /v1/absences/{id}/decide:
+    post:
+      tags: [Absences]
+      summary: Approve / reject заявки
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+            example: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+          example: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approve]
+              properties:
+                approve:
+                  type: boolean
+                  example: true
+            examples:
+              approve:
+                summary: Одобрить
+                value:
+                  approve: true
+              reject:
+                summary: Отклонить
+                value:
+                  approve: false
+      responses:
+        "200":
+          description: Решение записано
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DayException"
+
+  /v1/reports/me:
+    get:
+      tags: [Reports]
+      summary: Live-отчёт текущего пользователя
+      parameters:
+        - $ref: "#/components/parameters/from"
+        - $ref: "#/components/parameters/to"
+      responses:
+        "200":
+          description: Отчёт
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserReport"
+
+  /v1/reports/users/{userID}:
+    get:
+      tags: [Reports]
+      summary: Отчёт по пользователю
+      description: Свой отчёт или зав того же отдела.
+      parameters:
+        - name: userID
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+            example: "15b7fbe4-95d0-4319-a6c5-fa1ea13391ed"
+          example: "15b7fbe4-95d0-4319-a6c5-fa1ea13391ed"
+        - $ref: "#/components/parameters/from"
+        - $ref: "#/components/parameters/to"
+      responses:
+        "200":
+          description: Отчёт
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserReport"
+
+  /v1/reports/department:
+    get:
+      tags: [Reports]
+      summary: Отчёт по отделу (зав)
+      parameters:
+        - $ref: "#/components/parameters/from"
+        - $ref: "#/components/parameters/to"
+      responses:
+        "200":
+          description: Отчёт отдела
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DepartmentReport"
+        "403":
+          $ref: "#/components/responses/Error"
+
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: |
+        Swagger Authorize → Username `user`, Password `user`.
+        Мапится на DEV_USER_ID.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "Authorization: Bearer <jwt> (HS256, sub = UUID)"
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: access_token
+      description: Cookie после `POST /auth/login`
+
+  parameters:
+    from:
+      name: from
+      in: query
+      schema:
+        type: string
+        format: date
+        example: "2026-08-01"
+      example: "2026-08-01"
+      description: Начало периода YYYY-MM-DD. Если нет from/to — текущий месяц.
+    to:
+      name: to
+      in: query
+      schema:
+        type: string
+        format: date
+        example: "2026-08-31"
+      example: "2026-08-31"
+      description: Конец периода YYYY-MM-DD
+    departmentID:
+      name: departmentID
+      in: path
+      required: true
+      schema:
+        type: string
+        example: "dept-ivt-001"
+      description: ID отдела из employee_profile
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "unauthorized"
+    SnapshotRequired:
+      description: Нужен POST /v1/me/sync
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "user snapshot required; call POST /v1/me/sync"
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "validation"
+
+    SyncMeRequest:
+      type: object
+      required: [first_name, last_name, has_employee]
+      properties:
+        username:
+          type: string
+          example: "20809200450206"
+        first_name:
+          type: string
+          example: "Арслан"
+        last_name:
+          type: string
+          example: "Жумалиев"
+        middle_name:
+          type: string
+          example: ""
+        has_employee:
+          type: boolean
+          example: true
+        is_department_head:
+          type: boolean
+          example: false
+          description: true если пользователь — зав отдела
+        can_edit_timesheet:
+          type: boolean
+          example: false
+          description: право править табель отдела (зав, кадры, зам)
+        department_id:
+          type: string
+          example: "dept-ivt-001"
+          description: ID отдела из employee_profile
+        department_name:
+          type: string
+          example: "Кафедра ИВТ"
+
+    UserSnapshot:
+      type: object
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          example: "15b7fbe4-95d0-4319-a6c5-fa1ea13391ed"
+        university_id:
+          type: string
+          example: kstu
+        username:
+          type: string
+          example: "20809200450206"
+        first_name:
+          type: string
+          example: "Арслан"
+        last_name:
+          type: string
+          example: "Жумалиев"
+        middle_name:
+          type: string
+          example: ""
+        has_employee:
+          type: boolean
+          example: true
+        is_department_head:
+          type: boolean
+          example: false
+        can_edit_timesheet:
+          type: boolean
+          example: false
+        department_id:
+          type: string
+          nullable: true
+          example: "dept-ivt-001"
+        department_name:
+          type: string
+          example: "Кафедра ИВТ"
+        synced_at:
+          type: string
+          format: date-time
+          example: "2026-08-07T10:00:00+06:00"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-08-07T10:00:00+06:00"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-08-07T10:00:00+06:00"
+
+    ScanRequest:
+      type: object
+      required: [qr_url]
+      properties:
+        qr_url:
+          type: string
+          format: uri
+          description: Полный URL QR-стикера
+          example: "https://qr.kstu.kg/kstu/1/102"
+
+    ScanResult:
+      type: object
+      required: [action, session]
+      properties:
+        action:
+          type: string
+          enum: [check_in, check_out, duplicate_ignored, already_closed]
+          example: check_in
+        session:
+          $ref: "#/components/schemas/AttendanceSession"
+
+    AttendanceSession:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        university_id:
+          type: string
+          example: kstu
+        user_id:
+          type: string
+          format: uuid
+          example: "15b7fbe4-95d0-4319-a6c5-fa1ea13391ed"
+        work_date:
+          type: string
+          format: date
+          example: "2026-08-07"
+        department_id:
+          type: string
+          nullable: true
+          example: "dept-ivt-001"
+        entry_building:
+          type: string
+          example: "1"
+        entry_room:
+          type: string
+          example: "102"
+        exit_building:
+          type: string
+          nullable: true
+          example: null
+        exit_room:
+          type: string
+          nullable: true
+          example: null
+        opened_at:
+          type: string
+          format: date-time
+          example: "2026-08-07T09:05:00+06:00"
+        closed_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+        status:
+          type: string
+          enum: [open, closed]
+          example: open
+        close_reason:
+          type: string
+          nullable: true
+          enum: [manual, auto_cutoff, head]
+          example: null
+        duration_seconds:
+          type: integer
+          nullable: true
+          example: null
+        lunch_seconds:
+          type: integer
+          example: 3600
+        source:
+          type: string
+          enum: [scan, head, system]
+          example: scan
+        display_name:
+          type: string
+          example: "Жумалиев Арслан"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-08-07T09:05:00+06:00"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-08-07T09:05:00+06:00"
+
+    AbsenceRequest:
+      type: object
+      required: [work_date, code]
+      properties:
+        work_date:
+          type: string
+          format: date
+          example: "2026-08-07"
+        code:
+          type: string
+          example: БЛ
+          description: См. справочник кодов в docs/FRONTEND.md
+        note:
+          type: string
+          example: "Больничный лист"
+
+    HeadAbsenceRequest:
+      type: object
+      required: [user_id, work_date, code]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          example: "15b7fbe4-95d0-4319-a6c5-fa1ea13391ed"
+        work_date:
+          type: string
+          format: date
+          example: "2026-08-07"
+        code:
+          type: string
+          example: "П"
+        note:
+          type: string
+          example: "Прогул"
+
+    DayException:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+        university_id:
+          type: string
+          example: kstu
+        user_id:
+          type: string
+          format: uuid
+          example: "15b7fbe4-95d0-4319-a6c5-fa1ea13391ed"
+        department_id:
+          type: string
+          nullable: true
+          example: "dept-ivt-001"
+        work_date:
+          type: string
+          format: date
+          example: "2026-08-07"
+        code:
+          type: string
+          example: "БЛ"
+        status:
+          type: string
+          enum: [pending, approved, rejected]
+          example: pending
+        source:
+          type: string
+          enum: [employee_request, head, system]
+          example: employee_request
+        note:
+          type: string
+          example: "Больничный лист"
+        requested_by:
+          type: string
+          format: uuid
+          nullable: true
+          example: "15b7fbe4-95d0-4319-a6c5-fa1ea13391ed"
+        decided_by:
+          type: string
+          format: uuid
+          nullable: true
+          example: null
+        decided_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+        display_name:
+          type: string
+          example: "Жумалиев Арслан"
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-08-07T10:00:00+06:00"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2026-08-07T10:00:00+06:00"
+
+    DayReport:
+      type: object
+      properties:
+        date:
+          type: string
+          example: "2026-08-07"
+          description: YYYY-MM-DD
+        day_of_week:
+          type: string
+          example: Пятница
+        kind:
+          type: string
+          enum: [weekend, absence, attendance, missing, future]
+          example: attendance
+        code:
+          type: string
+          example: ""
+        working_time:
+          type: string
+          example: "08:00:00"
+        status:
+          type: string
+          example: closed
+        present:
+          type: boolean
+          nullable: true
+          example: true
+        sessions:
+          type: integer
+          example: 1
+        lunch_seconds:
+          type: integer
+          example: 3600
+        worked_seconds:
+          type: integer
+          example: 28800
+        needs_review:
+          type: boolean
+          example: false
+
+    UserReport:
+      type: object
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          example: "15b7fbe4-95d0-4319-a6c5-fa1ea13391ed"
+        display_name:
+          type: string
+          example: "Жумалиев Арслан"
+        department_id:
+          type: string
+          example: "dept-ivt-001"
+        department_name:
+          type: string
+          example: "Кафедра ИВТ"
+        days:
+          type: array
+          items:
+            $ref: "#/components/schemas/DayReport"
+        total_seconds:
+          type: integer
+          example: 28800
+        working_days:
+          type: integer
+          example: 1
+        missing_days:
+          type: integer
+          example: 0
+
+    DepartmentReport:
+      type: object
+      properties:
+        department_id:
+          type: string
+          example: "dept-ivt-001"
+        from:
+          type: string
+          format: date
+          example: "2026-08-01"
+        to:
+          type: string
+          format: date
+          example: "2026-08-31"
+        users:
+          type: array
+          items:
+            $ref: "#/components/schemas/UserReport"
+        missing_marks:
+          type: integer
+          example: 3
+
+    EditDayRequest:
+      type: object
+      required: [user_id, work_date, kind]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        work_date:
+          type: string
+          format: date
+        kind:
+          type: string
+          enum: [attendance, absence, clear]
+        opened_at:
+          type: string
+          format: date-time
+          nullable: true
+        closed_at:
+          type: string
+          format: date-time
+          nullable: true
+        code:
+          type: string
+        note:
+          type: string
+
+    EditDayResult:
+      type: object
+      properties:
+        kind:
+          type: string
+        session:
+          $ref: "#/components/schemas/AttendanceSession"
+        exception:
+          $ref: "#/components/schemas/DayException"
+
+    TimesheetEdit:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        editor_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        work_date:
+          type: string
+          format: date
+        action:
+          type: string
+          example: set_attendance
+        note:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    MissingMark:
+      type: object
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+        date:
+          type: string
+          format: date
+        day_of_week:
+          type: string
+
+    DepartmentExport:
+      type: object
+      properties:
+        department_id:
+          type: string
+        department_name:
+          type: string
+        from:
+          type: string
+          format: date
+        to:
+          type: string
+          format: date
+        employees:
+          type: array
+          items:
+            $ref: "#/components/schemas/UserSnapshot"
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttendanceSession"
+        exceptions:
+          type: array
+          items:
+            $ref: "#/components/schemas/DayException"
+        edits:
+          type: array
+          items:
+            $ref: "#/components/schemas/TimesheetEdit"
+        timesheet:
+          $ref: "#/components/schemas/DepartmentReport"
+        missing:
+          type: array
+          items:
+            $ref: "#/components/schemas/MissingMark"
+
+security:
+  - basicAuth: []
+  - bearerAuth: []
+  - cookieAuth: []
